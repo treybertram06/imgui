@@ -191,6 +191,11 @@
 #define GLFW_HAS_GETERROR               (GLFW_VERSION_COMBINED >= 3300) // 3.3+ glfwGetError()
 #define GLFW_HAS_GETPLATFORM            (GLFW_VERSION_COMBINED >= 3400) // 3.4+ glfwGetPlatform()
 
+#ifdef HN_PLATFORM_LINUX
+#include <X11/Xatom.h>
+#endif
+
+
 // Map GLFWWindow* to ImGuiContext*.
 // - Would be simpler if we could use glfwSetWindowUserPointer()/glfwGetWindowUserPointer(), but this is a single and shared resource.
 // - Would be simpler if we could use e.g. std::map<> as well. But we don't.
