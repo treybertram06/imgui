@@ -225,6 +225,7 @@ struct ImGui_ImplVulkanH_FrameSemaphores
 {
     VkSemaphore         ImageAcquiredSemaphore;
     VkSemaphore         RenderCompleteSemaphore;
+    VkFence             LastSubmitFence;
 };
 
 // Helper structure to hold the data needed by one rendering context into one OS window

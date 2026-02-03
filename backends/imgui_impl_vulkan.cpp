@@ -1626,11 +1626,13 @@ void ImGui_ImplVulkanH_CreateWindowCommandBuffers(VkPhysicalDevice physical_devi
         {
             VkSemaphoreCreateInfo info = {};
             info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-            err = vkCreateSemaphore(device, &info, allocator, &fsd->ImageAcquiredSemaphore);
+            VkResult err = vkCreateSemaphore(device, &info, allocator, &fsd->ImageAcquiredSemaphore);
             check_vk_result(err);
             err = vkCreateSemaphore(device, &info, allocator, &fsd->RenderCompleteSemaphore);
             check_vk_result(err);
         }
+
+        fsd->LastSubmitFence = VK_NULL_HANDLE;
     }
 }
 
@@ -1720,7 +1722,7 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
         err = vkGetSwapchainImagesKHR(device, wd->Swapchain, &wd->ImageCount, backbuffers);
         check_vk_result(err);
 
-        wd->SemaphoreCount = wd->ImageCount + 1;
+        wd->SemaphoreCount = wd->ImageCount;
         wd->Frames.resize(wd->ImageCount);
         wd->FrameSemaphores.resize(wd->SemaphoreCount);
         memset(wd->Frames.Data, 0, wd->Frames.size_in_bytes());
@@ -1938,6 +1940,7 @@ void ImGui_ImplVulkanH_DestroyFrameSemaphores(VkDevice device, ImGui_ImplVulkanH
     vkDestroySemaphore(device, fsd->ImageAcquiredSemaphore, allocator);
     vkDestroySemaphore(device, fsd->RenderCompleteSemaphore, allocator);
     fsd->ImageAcquiredSemaphore = fsd->RenderCompleteSemaphore = VK_NULL_HANDLE;
+    fsd->LastSubmitFence = VK_NULL_HANDLE;
 }
 
 void ImGui_ImplVulkanH_DestroyAllViewportsRenderBuffers(VkDevice device, const VkAllocationCallbacks* allocator)
@@ -2073,142 +2076,164 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
 
     if (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal)
     {
-        ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage);
+        ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator,
+                                               (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount,
+                                               v->PipelineInfoForViewports.SwapChainImageUsage);
         vd->SwapChainNeedRebuild = vd->SwapChainSuboptimal = false;
     }
 
-    ImGui_ImplVulkanH_Frame* fd = nullptr;
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
+    // Acquire slot (ring)
+    ImGui_ImplVulkanH_FrameSemaphores* fsd_acquire = &wd->FrameSemaphores[wd->SemaphoreIndex];
+
+    // Ensure the acquire semaphore isn't still pending: wait for the last submit that used it.
+    if (fsd_acquire->LastSubmitFence != VK_NULL_HANDLE)
     {
-        {
-            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, UINT64_MAX, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
-            if (err == VK_ERROR_OUT_OF_DATE_KHR)
-            {
-                vd->SwapChainNeedRebuild = true; // Since we are not going to swap this frame anyway, it's ok that recreation happens on next frame.
-                return;
-            }
-            if (err == VK_SUBOPTIMAL_KHR)
-                vd->SwapChainSuboptimal = true;
-            else
-                check_vk_result(err);
-            fd = &wd->Frames[wd->FrameIndex];
-        }
-        for (;;)
-        {
-            err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 100);
-            if (err == VK_SUCCESS) break;
-            if (err == VK_TIMEOUT) continue;
-            check_vk_result(err);
-        }
-        {
-            err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
-            check_vk_result(err);
-            VkCommandBufferBeginInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
-            check_vk_result(err);
-        }
-        {
-            ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
-            memcpy(&wd->ClearValue.color.float32[0], &clear_color, 4 * sizeof(float));
-        }
+        err = vkWaitForFences(v->Device, 1, &fsd_acquire->LastSubmitFence, VK_TRUE, UINT64_MAX);
+        check_vk_result(err);
+    }
+
+    // Acquire next image
+    err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, UINT64_MAX, fsd_acquire->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
+    if (err == VK_ERROR_OUT_OF_DATE_KHR)
+    {
+        vd->SwapChainNeedRebuild = true;
+        return;
+    }
+    if (err == VK_SUBOPTIMAL_KHR)
+        vd->SwapChainSuboptimal = true;
+    else
+        check_vk_result(err);
+
+    ImGui_ImplVulkanH_Frame* fd = &wd->Frames[wd->FrameIndex];
+
+    // Ensure this command buffer is no longer in use (fixes vkResetCommandPool/vkBeginCommandBuffer warnings)
+    err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, UINT64_MAX);
+    check_vk_result(err);
+    err = vkResetFences(v->Device, 1, &fd->Fence);
+    check_vk_result(err);
+
+    // Reset command pool and begin
+    err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
+    check_vk_result(err);
+
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    err = vkBeginCommandBuffer(fd->CommandBuffer, &begin_info);
+    check_vk_result(err);
+
+    // Clear color (optional)
+    {
+        ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+        memcpy(&wd->ClearValue.color.float32[0], &clear_color, 4 * sizeof(float));
+    }
+
 #ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (v->UseDynamicRendering)
-        {
-            // Transition swapchain image to a layout suitable for drawing.
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            barrier.image = fd->Backbuffer;
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(fd->CommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_NONE, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    if (v->UseDynamicRendering)
+    {
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.image = fd->Backbuffer;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(fd->CommandBuffer,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_NONE,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-            VkRenderingAttachmentInfo attachmentInfo = {};
-            attachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-            attachmentInfo.imageView = fd->BackbufferView;
-            attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            attachmentInfo.resolveMode = VK_RESOLVE_MODE_NONE;
-            attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachmentInfo.clearValue = wd->ClearValue;
+        VkRenderingAttachmentInfo attachmentInfo = {};
+        attachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+        attachmentInfo.imageView = fd->BackbufferView;
+        attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachmentInfo.resolveMode = VK_RESOLVE_MODE_NONE;
+        attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachmentInfo.clearValue = wd->ClearValue;
 
-            VkRenderingInfo renderingInfo = {};
-            renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
-            renderingInfo.renderArea.extent.width = wd->Width;
-            renderingInfo.renderArea.extent.height = wd->Height;
-            renderingInfo.layerCount = 1;
-            renderingInfo.viewMask = 0;
-            renderingInfo.colorAttachmentCount = 1;
-            renderingInfo.pColorAttachments = &attachmentInfo;
+        VkRenderingInfo renderingInfo = {};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
+        renderingInfo.renderArea.extent.width = wd->Width;
+        renderingInfo.renderArea.extent.height = wd->Height;
+        renderingInfo.layerCount = 1;
+        renderingInfo.viewMask = 0;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &attachmentInfo;
 
-            ImGuiImplVulkanFuncs_vkCmdBeginRenderingKHR(fd->CommandBuffer, &renderingInfo);
-        }
-        else
+        ImGuiImplVulkanFuncs_vkCmdBeginRenderingKHR(fd->CommandBuffer, &renderingInfo);
+    }
+    else
 #endif
-        {
-            VkRenderPassBeginInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            info.renderPass = wd->RenderPass;
-            info.framebuffer = fd->Framebuffer;
-            info.renderArea.extent.width = wd->Width;
-            info.renderArea.extent.height = wd->Height;
-            info.clearValueCount = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? 0 : 1;
-            info.pClearValues = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? nullptr : &wd->ClearValue;
-            vkCmdBeginRenderPass(fd->CommandBuffer, &info, VK_SUBPASS_CONTENTS_INLINE);
-        }
+    {
+        VkRenderPassBeginInfo rp_begin = {};
+        rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp_begin.renderPass = wd->RenderPass;
+        rp_begin.framebuffer = fd->Framebuffer;
+        rp_begin.renderArea.extent.width = wd->Width;
+        rp_begin.renderArea.extent.height = wd->Height;
+        rp_begin.clearValueCount = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? 0 : 1;
+        rp_begin.pClearValues = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? nullptr : &wd->ClearValue;
+        vkCmdBeginRenderPass(fd->CommandBuffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
     }
 
     ImGui_ImplVulkan_RenderDrawData(viewport->DrawData, fd->CommandBuffer, bd->PipelineForViewports);
 
-    {
 #ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (v->UseDynamicRendering)
-        {
-            ImGuiImplVulkanFuncs_vkCmdEndRenderingKHR(fd->CommandBuffer);
+    if (v->UseDynamicRendering)
+    {
+        ImGuiImplVulkanFuncs_vkCmdEndRenderingKHR(fd->CommandBuffer);
 
-            // Transition image to a layout suitable for presentation
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barrier.image = fd->Backbuffer;
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(fd->CommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-        }
-        else
-#endif
-        {
-            vkCmdEndRenderPass(fd->CommandBuffer);
-        }
-        {
-            VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            VkSubmitInfo info = {};
-            info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            info.waitSemaphoreCount = 1;
-            info.pWaitSemaphores = &fsd->ImageAcquiredSemaphore;
-            info.pWaitDstStageMask = &wait_stage;
-            info.commandBufferCount = 1;
-            info.pCommandBuffers = &fd->CommandBuffer;
-            info.signalSemaphoreCount = 1;
-            info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
-
-            err = vkEndCommandBuffer(fd->CommandBuffer);
-            check_vk_result(err);
-            err = vkResetFences(v->Device, 1, &fd->Fence);
-            check_vk_result(err);
-            err = vkQueueSubmit(v->Queue, 1, &info, fd->Fence);
-            check_vk_result(err);
-        }
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.image = fd->Backbuffer;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(fd->CommandBuffer,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
+    else
+#endif
+    {
+        vkCmdEndRenderPass(fd->CommandBuffer);
+    }
+
+    // Submit
+    ImGui_ImplVulkanH_FrameSemaphores* fsd_present = &wd->FrameSemaphores[wd->FrameIndex];
+
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submit_info = {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &fsd_acquire->ImageAcquiredSemaphore;
+    submit_info.pWaitDstStageMask = &wait_stage;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &fd->CommandBuffer;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &fsd_present->RenderCompleteSemaphore;
+
+    err = vkEndCommandBuffer(fd->CommandBuffer);
+    check_vk_result(err);
+
+    // Submit fence must correspond to this command buffer (fd->Fence)
+    err = vkQueueSubmit(v->Queue, 1, &submit_info, fd->Fence);
+    check_vk_result(err);
+
+    // Remember which submit fence makes it safe to reuse this acquire semaphore slot next time.
+    fsd_acquire->LastSubmitFence = fd->Fence;
+
+    // Advance acquire ring
+    wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount;
 }
+
 
 static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
 {
@@ -2225,14 +2250,17 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     VkResult err;
     uint32_t present_index = wd->FrameIndex;
 
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
+    // Present waits on per-image RenderCompleteSemaphore (the important part for your validation warning)
+    ImGui_ImplVulkanH_FrameSemaphores* fsd_present = &wd->FrameSemaphores[wd->FrameIndex];
+
     VkPresentInfoKHR info = {};
     info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     info.waitSemaphoreCount = 1;
-    info.pWaitSemaphores = &fsd->RenderCompleteSemaphore;
+    info.pWaitSemaphores = &fsd_present->RenderCompleteSemaphore;
     info.swapchainCount = 1;
     info.pSwapchains = &wd->Swapchain;
     info.pImageIndices = &present_index;
+
     err = vkQueuePresentKHR(v->Queue, &info);
     if (err == VK_ERROR_OUT_OF_DATE_KHR)
     {
@@ -2243,7 +2271,6 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
         vd->SwapChainSuboptimal = true;
     else
         check_vk_result(err);
-    wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount; // Now we can use the next set of semaphores
 }
 
 void ImGui_ImplVulkan_InitMultiViewportSupport()
